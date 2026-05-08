@@ -277,29 +277,31 @@ class BytenutRenewal:
         try:
             if not sb.execute_script("return !!document.querySelector('.extend-reward-dialog');"):
                 return True
-
             self.log("🛡️ 处理扩展奖励选择...")
-            # 优先通过类名点击 Watch Ad 选项
+            # 点击 Watch Ad 选项
             sb.execute_script("""
-                var btn = document.querySelector('button.reward-option--watch');
+                var btn = document.querySelector('button.reward-option--watch:not([disabled])');
                 if (btn) btn.click();
             """)
-            time.sleep(2)
+            time.sleep(3)
             return True
         except Exception as e:
             self.log(f"奖励选择处理异常: {e}")
             return True
 
-    # ---------- 处理广告验证弹窗（原有流程） ----------
+    # ---------- 处理广告验证弹窗 ----------
     def handle_ad_verification(self, sb):
-        """处理 adsterra-rewarded-dialog 弹窗，完成 Watch Ad → 广告页 → Claim Reward"""
-        try:
-            # 等待弹窗出现
-            if not sb.execute_script("return !!document.querySelector('div.adsterra-rewarded-dialog');"):
-                return True
-            self.log("🛡️ 处理广告验证...")
+        start = time.time()
+        while time.time() - start < 15:
+            if sb.execute_script("return !!document.querySelector('div.adsterra-rewarded-dialog');"):
+                break
             time.sleep(1)
+        else:
+            self.log("未检测到广告验证弹窗，可能已直接完成")
+            return True
 
+        self.log("🛡️ 处理广告验证...")
+        try:
             # 点击 Watch Ad
             sb.execute_script("""
                 var btn = document.querySelector('div.adsterra-rewarded-dialog button.el-button--primary');
@@ -307,19 +309,17 @@ class BytenutRenewal:
             """)
             time.sleep(3)
 
-            # 处理新窗口
+            # 处理广告窗口
             original_window = sb.driver.current_window_handle
             if len(sb.driver.window_handles) > 1:
                 for handle in sb.driver.window_handles:
                     if handle != original_window:
                         sb.driver.switch_to.window(handle)
                         break
-                # 检查是否被扩展拦截（可能没有实际页面，但仍尝试等待）
                 try:
                     time.sleep(12)
                 except:
                     pass
-                # 如果窗口仍然存在，则关闭它
                 if len(sb.driver.window_handles) > 1:
                     try:
                         sb.driver.close()
@@ -328,9 +328,17 @@ class BytenutRenewal:
                 sb.driver.switch_to.window(original_window)
                 time.sleep(2)
             else:
-                self.log("未检测到广告窗口，继续...")
+                self.log("未检测到广告窗口，可能已被拦截，直接等待 Claim Reward")
 
-            # 点击 Claim Reward
+            # 等待并点击 Claim Reward
+            claim_start = time.time()
+            while time.time() - claim_start < 20:
+                if sb.execute_script("""
+                    var btn = document.querySelector('div.adsterra-rewarded-dialog button.el-button--success');
+                    return btn && !btn.disabled;
+                """):
+                    break
+                time.sleep(1)
             sb.execute_script("""
                 var btn = document.querySelector('div.adsterra-rewarded-dialog button.el-button--success');
                 if(btn) btn.click();
@@ -361,13 +369,10 @@ class BytenutRenewal:
 
         time.sleep(2)
 
-        # 处理可能出现的奖励选择弹窗（新）
         self.handle_reward_picker(sb)
 
-        # 处理原有的广告验证弹窗
         self.handle_ad_verification(sb)
 
-        # 验证结果
         time.sleep(5)
         for _ in range(6):
             new_ext = self.get_extension_data(sb, server_id)
