@@ -63,7 +63,7 @@ jobs:
           PROXY: ${{ steps.proxy.outputs.proxy_server }}
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
-          xvfb-run -a python3 main.py
+          xvfb-run -a python3 main1.py
 
       - name: 清理历史
         if: always()
