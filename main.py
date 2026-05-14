@@ -1,12 +1,10 @@
 import time
 import os
-import json
-import re
 import requests
 import platform
 from datetime import datetime
 
-# 虚拟显示器处理（针对无头 Linux 环境）
+# 针对 Linux 环境（GitHub Actions）的虚拟显示器配置
 if "DISPLAY" not in os.environ:
     if platform.system().lower() == "linux":
         try:
@@ -19,20 +17,19 @@ if "DISPLAY" not in os.environ:
 
 from seleniumbase import SB
 
-# ================= 配置区域 =================
-# 代理逻辑：优先读取 GitHub Actions 的 sing-box 变量
-RAW_PROXY = os.getenv("PROXY_SOCKS5") or os.getenv("PROXY") or ""
+# ================= 代理适配逻辑 =================
+# 直接获取 IP:PORT，不带协议头，不强制使用 socks5h
+RAW_PROXY = os.getenv("PROXY_SOCKS5") or os.getenv("PROXY") or "127.0.0.1:40000"
 
 def format_proxy(p):
     if not p: return None
-    # 强制使用 socks5h 以支持远程 DNS 解析，这对绕过某些限制至关重要
-    if p.startswith("socks5://"):
-        return p.replace("socks5://", "socks5h://")
-    if "://" not in p:
-        return f"socks5h://{p}"
-    return p
+    # 仅保留 IP:PORT 格式，交给 SeleniumBase 默认处理
+    if "://" in p:
+        p = p.split("://")[-1]
+    return f"socks5://{p}"
 
 PROXY = format_proxy(RAW_PROXY)
+# ===============================================
 
 TG_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
@@ -42,19 +39,17 @@ URL_LOGIN_PANEL = "https://www.bytenut.com/auth/login"
 URL_HOMEPAGE = "https://www.bytenut.com/homepage"
 API_SERVER_LIST = "https://www.bytenut.com/game-panel/api/gpPanelServer/user/servers"
 API_EXTENSION_INFO = "https://www.bytenut.com/game-panel/api/gp-free-server/extension-info/{}"
-API_START_SERVER = "https://www.bytenut.com/game-panel/api/serverStartQueue/requestStart/{}"
 
 RENEW_MENU = '//li[contains(., "RENEW SERVER")]'
 EXTEND_BTN = "button.extend-btn"
 
 def parse_accounts(raw: str):
     accounts = []
+    if not raw: return accounts
     for line in raw.strip().split('\n'):
         line = line.strip()
-        if not line or '-----' not in line:
-            continue
-        parts = line.split('-----', 1)
-        if len(parts) == 2:
+        if '-----' in line:
+            parts = line.split('-----', 1)
             accounts.append((parts[0].strip(), parts[1].strip()))
     return accounts
 
@@ -64,145 +59,83 @@ class BytenutRenewal:
         self.screenshot_dir = os.path.join(self.BASE_DIR, "artifacts")
         os.makedirs(self.screenshot_dir, exist_ok=True)
         
-        # 初始化带代理的 Session 用于所有 API 和 TG 通知
+        # 初始化 Session
         self.session = requests.Session()
         if PROXY:
-            print(f"[{time.strftime('%H:%M:%S')}] [PROXY] 全局代理已设为: {PROXY}")
-            # requests 不支持 socks5h 前缀，需转回 socks5
-            req_proxy = PROXY.replace("socks5h://", "socks5://")
-            self.session.proxies = {"http": req_proxy, "https": req_proxy}
-
-    def mask_account(self, u):
-        if not u: return "Unknown"
-        u = u.strip()
-        if "@" in u:
-            local, domain = u.split("@", 1)
-            local = local[:2] + "*" * (len(local) - 2) if len(local) > 2 else local[0] + "*"
-            return f"{local}@{domain}"
-        return u[:2] + "*" * (len(u) - 2) if len(u) > 2 else u[0] + "*"
-
-    def mask_server_id(self, sid):
-        if not sid: return "****"
-        return "****" + sid[-4:] if len(sid) > 4 else "****"
+            # 这里的代理仅供 API 和 TG 发送使用
+            self.session.proxies = {"http": PROXY, "https": PROXY}
 
     def log(self, msg):
-        print(f"[{time.strftime('%H:%M:%S')}] [INFO] {msg}", flush=True)
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
     def shot(self, sb, name):
         path = os.path.join(self.screenshot_dir, name)
         sb.save_screenshot(path)
         return path
 
-    def send_tg(self, icon, title, account_name, server_id, state_str, expiry_str, extra="", screenshot=None):
+    def send_tg(self, icon, title, account, server_id, state, expiry, extra="", screenshot=None):
         if not TG_TOKEN or not TG_CHAT_ID: return
-        msg = f"{icon} {title}\n\n账号: {account_name}\n服务器: {server_id}\n状态: {state_str}\n到期: {expiry_str}\n"
-        if extra: msg += f"\n{extra}\n"
-        msg += "\nByteNut Auto Renew"
+        msg = f"{icon} {title}\n\n账号: {account}\nID: {server_id}\n状态: {state}\n到期: {expiry}\n"
+        if extra: msg += f"\n提示: {extra}\n"
         try:
-            if screenshot and os.path.exists(screenshot):
+            if screenshot:
                 url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
                 self.session.post(url, data={"chat_id": TG_CHAT_ID, "caption": msg}, files={"photo": open(screenshot, "rb")}, timeout=20)
             else:
                 url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
                 self.session.post(url, data={"chat_id": TG_CHAT_ID, "text": msg}, timeout=20)
         except Exception as e:
-            self.log(f"TG发送失败: {e}")
+            self.log(f"TG通知发送失败: {e}")
 
-    def get_full_cookies(self, sb):
-        try:
-            result = sb.driver.execute_cdp_cmd('Network.getCookies', {})
-            return {c['name']: c['value'] for c in result.get('cookies', [])}
-        except:
-            return {c['name']: c['value'] for c in sb.get_cookies()}
-
-    def get_yl_token(self, sb):
-        return sb.execute_script("return localStorage.getItem('yl-token') || sessionStorage.getItem('yl-token') || '';")
-
-    def call_api(self, sb, url, method="GET", referer=URL_HOMEPAGE):
+    def call_api(self, sb, url):
+        yl_token = sb.execute_script("return localStorage.getItem('yl-token') || '';")
         headers = {
             "User-Agent": sb.execute_script("return navigator.userAgent;"),
-            "Accept": "application/json, text/plain, */*",
-            "Referer": referer,
-            "Yl-Token": self.get_yl_token(sb)
+            "Yl-Token": yl_token,
+            "Referer": URL_HOMEPAGE
         }
         try:
-            if method == "GET":
-                resp = self.session.get(url, headers=headers, cookies=self.get_full_cookies(sb), timeout=15)
-            else:
-                headers["Content-Type"] = "application/x-form-urlencoded"
-                resp = self.session.post(url, headers=headers, cookies=self.get_full_cookies(sb), timeout=15)
-            
-            res_json = resp.json()
-            return res_json.get('data') if res_json.get('code') == 200 else None
-        except Exception as e:
-            self.log(f"API {method} 失败: {e}")
+            # 同步 Cookie
+            for cookie in sb.get_cookies():
+                self.session.cookies.set(cookie['name'], cookie['value'])
+            resp = self.session.get(url, headers=headers, timeout=15)
+            return resp.json().get('data') if resp.status_code == 200 else None
+        except:
             return None
 
-    def remove_overlay_ads(self, sb):
-        sb.execute_script("""
-            (function() {
-                var btn = document.getElementById('ez-accept-all');
-                if (btn) btn.click();
-                document.querySelectorAll('ins.adsbygoogle, iframe[id^="aswift"], .ezoic-floating-bottom').forEach(el => el.remove());
-                document.body.style.overflow = 'auto';
-            })();
-        """)
-
-    def wait_turnstile(self, sb, timeout=60):
-        self.log("⏳ 正在处理 Turnstile 验证...")
-        start = time.time()
-        while time.time() - start < timeout:
-            self.remove_overlay_ads(sb)
+    def handle_turnstile(self, sb):
+        self.log("⏳ 等待检测 Turnstile 验证...")
+        for _ in range(30):
+            sb.execute_script("document.querySelectorAll('.ezoic-floating-bottom, #ez-accept-all').forEach(el => el.remove());")
             try:
-                # 尝试自动寻找并点击（SeleniumBase UC 特色功能）
                 sb.uc_gui_click_captcha()
-                val = sb.execute_script('return document.querySelector("[name=cf-turnstile-response]")?.value')
-                if val and len(val) > 20:
-                    self.log("✅ Turnstile 验证通过")
+                res = sb.execute_script('return document.querySelector("[name=cf-turnstile-response]")?.value')
+                if res and len(res) > 20:
+                    self.log("✅ 验证已通过")
                     return True
             except: pass
             time.sleep(2)
         return False
 
-    def try_extend(self, sb, server_id, old_expiry):
-        if not self.wait_turnstile(sb): return False, ""
-        self.remove_overlay_ads(sb)
-        try:
-            if sb.is_element_visible(EXTEND_BTN):
-                sb.click(EXTEND_BTN)
-                time.sleep(3)
-                # 处理弹窗
-                sb.execute_script("var b = document.querySelector('button.reward-option--watch'); if(b) b.click();")
-                time.sleep(5)
-                # 模拟观看后的 Claim
-                sb.execute_script("var b = document.querySelector('div.adsterra-rewarded-dialog button.el-button--success'); if(b) b.click();")
-                time.sleep(5)
-                
-                # 检查结果
-                new_data = self.call_api(sb, API_EXTENSION_INFO.format(server_id))
-                new_expiry = new_data.get("expiredTime") if new_data else ""
-                if new_expiry and new_expiry != old_expiry:
-                    return True, new_expiry
-        except Exception as e:
-            self.log(f"续期点击异常: {e}")
-        return False, ""
-
     def run(self):
         accounts = parse_accounts(ACCOUNTS)
-        if not accounts: return
+        if not accounts:
+            self.log("❌ 未检测到账号配置")
+            return
 
         for idx, (user, pwd) in enumerate(accounts, 1):
-            self.log(f"开始处理账号: {self.mask_account(user)}")
+            self.log(f"--- 账号 [{idx}]: {user[:3]}*** ---")
             
-            # 使用更严谨的代理注入方式
             with SB(uc=True, test=True, headed=True, proxy=PROXY) as sb:
                 try:
-                    # 验证代理 IP（调试用，可在日志查看出口 IP）
+                    # 检查 IP 出口（确认为 Cloudflare 网络）
                     try:
-                        curr_ip = sb.execute_script("return fetch('https://api.ipify.org').then(r => r.text())")
-                        self.log(f"当前浏览器出口 IP: {curr_ip}")
-                    except: pass
+                        sb.open("https://1.1.1.1/help") # 访问 1.1.1.1 内部页检查
+                        self.log("📡 已通过代理建立连接")
+                    except:
+                        pass
 
+                    # 登录
                     sb.uc_open_with_reconnect(URL_LOGIN_PANEL, 5)
                     sb.type('input[placeholder="Username"]', user)
                     sb.type('input[placeholder="Password"]', pwd)
@@ -213,28 +146,46 @@ class BytenutRenewal:
                         self.log("❌ 登录失败")
                         continue
 
-                    # 获取服务器状态
+                    # 获取服务器列表
                     servers = self.call_api(sb, API_SERVER_LIST)
                     if not servers: continue
                     
                     srv = servers[0]
                     sid = srv['id']
-                    old_exp = srv.get('expiredTime', '')
+                    old_exp = srv.get('expiredTime', 'Unknown')
                     
-                    # 进入详情页
+                    # 续期页面
                     sb.uc_open_with_reconnect(f"https://www.bytenut.com/free-gamepanel/{sid}", 5)
                     time.sleep(3)
                     sb.click(RENEW_MENU)
                     time.sleep(2)
 
-                    success, new_exp = self.try_extend(sb, sid, old_exp)
-                    if success:
-                        self.send_tg("✅", "续期成功", user, sid, "Running", new_exp, screenshot=self.shot(sb, f"success_{idx}.png"))
+                    # 自动续期逻辑
+                    if self.handle_turnstile(sb):
+                        if sb.is_element_visible(EXTEND_BTN):
+                            sb.click(EXTEND_BTN)
+                            time.sleep(5)
+                            # 点击 Watch Ad
+                            sb.execute_script("var b = document.querySelector('button.reward-option--watch'); if(b) b.click();")
+                            time.sleep(15) 
+                            # 点击 Claim
+                            sb.execute_script("var b = document.querySelector('button.el-button--success'); if(b) b.click();")
+                            time.sleep(5)
+                            
+                            new_info = self.call_api(sb, API_EXTENSION_INFO.format(sid))
+                            new_exp = new_info.get('expiredTime', old_exp) if new_info else old_exp
+                            
+                            if new_exp != old_exp:
+                                self.log(f"🎉 续期成功: {new_exp}")
+                                self.send_tg("✅", "续期成功", user, sid, "Running", new_exp, screenshot=self.shot(sb, f"ok_{idx}.png"))
+                            else:
+                                self.log("ℹ️ 时间未更新 (可能在冷却)")
+                                self.send_tg("⏳", "未更新", user, sid, "Running", old_exp)
                     else:
-                        self.send_tg("⚠️", "未续期", user, sid, "Unknown", old_exp, "可能还在冷却或验证失败")
+                        self.send_tg("❌", "验证超时", user, sid, "Error", old_exp)
 
                 except Exception as e:
-                    self.log(f"流程中断: {e}")
+                    self.log(f"💥 异常: {str(e)}")
 
 if __name__ == "__main__":
     BytenutRenewal().run()
