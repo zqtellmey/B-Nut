@@ -4,7 +4,7 @@ import requests
 import platform
 from datetime import datetime
 
-# 针对 Linux 环境（GitHub Actions）的虚拟显示器配置
+# 虚拟显示器处理（针对 GitHub Actions 运行环境）
 if "DISPLAY" not in os.environ:
     if platform.system().lower() == "linux":
         try:
@@ -17,20 +17,8 @@ if "DISPLAY" not in os.environ:
 
 from seleniumbase import SB
 
-# ================= 代理适配逻辑 =================
-# 直接获取 IP:PORT，不带协议头，不强制使用 socks5h
-RAW_PROXY = os.getenv("PROXY_SOCKS5") or os.getenv("PROXY") or "127.0.0.1:40000"
-
-def format_proxy(p):
-    if not p: return None
-    # 仅保留 IP:PORT 格式，交给 SeleniumBase 默认处理
-    if "://" in p:
-        p = p.split("://")[-1]
-    return f"socks5://{p}"
-
-PROXY = format_proxy(RAW_PROXY)
-# ===============================================
-
+# ================= 配置区域 =================
+# 删除了 PROXY 变量和 format_proxy 函数，完全透传系统网络
 TG_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 ACCOUNTS = os.getenv("BYTENUT", "")
@@ -58,12 +46,8 @@ class BytenutRenewal:
         self.BASE_DIR = os.path.dirname(os.path.abspath(__file__))
         self.screenshot_dir = os.path.join(self.BASE_DIR, "artifacts")
         os.makedirs(self.screenshot_dir, exist_ok=True)
-        
-        # 初始化 Session
+        # Requests 此时会自动继承系统环境变量或直接走全局网卡，无需设置 proxies
         self.session = requests.Session()
-        if PROXY:
-            # 这里的代理仅供 API 和 TG 发送使用
-            self.session.proxies = {"http": PROXY, "https": PROXY}
 
     def log(self, msg):
         print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -95,9 +79,9 @@ class BytenutRenewal:
             "Referer": URL_HOMEPAGE
         }
         try:
-            # 同步 Cookie
             for cookie in sb.get_cookies():
                 self.session.cookies.set(cookie['name'], cookie['value'])
+            # 这里不加 proxy 参数，直接发请求
             resp = self.session.get(url, headers=headers, timeout=15)
             return resp.json().get('data') if resp.status_code == 200 else None
         except:
@@ -119,23 +103,25 @@ class BytenutRenewal:
 
     def run(self):
         accounts = parse_accounts(ACCOUNTS)
-        if not accounts:
-            self.log("❌ 未检测到账号配置")
-            return
+        if not accounts: return
 
         for idx, (user, pwd) in enumerate(accounts, 1):
             self.log(f"--- 账号 [{idx}]: {user[:3]}*** ---")
             
-            with SB(uc=True, test=True, headed=True, proxy=PROXY) as sb:
+            # 关键修改：取消 proxy 参数，让浏览器直接走系统网卡
+            with SB(uc=True, test=True, headed=True) as sb:
                 try:
-                    # 检查 IP 出口（确认为 Cloudflare 网络）
+                    # 验证网络出口
                     try:
-                        sb.open("https://1.1.1.1/help") # 访问 1.1.1.1 内部页检查
-                        self.log("📡 已通过代理建立连接")
+                        sb.open("https://www.cloudflare.com/cdn-cgi/trace")
+                        trace_text = sb.get_text("body")
+                        ip_line = [l for l in trace_text.split('\n') if l.startswith('ip=')]
+                        self.log(f"📡 系统当前出口 IP: {ip_line[0] if ip_line else 'Unknown'}")
+                        if "warp=on" in trace_text:
+                            self.log("✅ WARP 全局状态确认为: ON")
                     except:
                         pass
 
-                    # 登录
                     sb.uc_open_with_reconnect(URL_LOGIN_PANEL, 5)
                     sb.type('input[placeholder="Username"]', user)
                     sb.type('input[placeholder="Password"]', pwd)
@@ -146,29 +132,23 @@ class BytenutRenewal:
                         self.log("❌ 登录失败")
                         continue
 
-                    # 获取服务器列表
                     servers = self.call_api(sb, API_SERVER_LIST)
                     if not servers: continue
                     
-                    srv = servers[0]
-                    sid = srv['id']
-                    old_exp = srv.get('expiredTime', 'Unknown')
+                    sid = servers[0]['id']
+                    old_exp = servers[0].get('expiredTime', 'Unknown')
                     
-                    # 续期页面
                     sb.uc_open_with_reconnect(f"https://www.bytenut.com/free-gamepanel/{sid}", 5)
                     time.sleep(3)
                     sb.click(RENEW_MENU)
                     time.sleep(2)
 
-                    # 自动续期逻辑
                     if self.handle_turnstile(sb):
                         if sb.is_element_visible(EXTEND_BTN):
                             sb.click(EXTEND_BTN)
                             time.sleep(5)
-                            # 点击 Watch Ad
                             sb.execute_script("var b = document.querySelector('button.reward-option--watch'); if(b) b.click();")
                             time.sleep(15) 
-                            # 点击 Claim
                             sb.execute_script("var b = document.querySelector('button.el-button--success'); if(b) b.click();")
                             time.sleep(5)
                             
@@ -179,7 +159,6 @@ class BytenutRenewal:
                                 self.log(f"🎉 续期成功: {new_exp}")
                                 self.send_tg("✅", "续期成功", user, sid, "Running", new_exp, screenshot=self.shot(sb, f"ok_{idx}.png"))
                             else:
-                                self.log("ℹ️ 时间未更新 (可能在冷却)")
                                 self.send_tg("⏳", "未更新", user, sid, "Running", old_exp)
                     else:
                         self.send_tg("❌", "验证超时", user, sid, "Error", old_exp)
