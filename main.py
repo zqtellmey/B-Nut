@@ -17,7 +17,7 @@ if "DISPLAY" not in os.environ:
 from seleniumbase import SB
 
 # ================= 配置区域 =================
-PROXY = os.getenv("PROXY") or None
+# PROXY = os.getenv("PROXY") or None
 TG_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 ACCOUNTS = os.getenv("BYTENUT", "")
@@ -736,7 +736,7 @@ class BytenutRenewal:
                     "--no-sandbox,--disable-dev-shm-usage,"
                     "--disable-gpu,--window-size=1280,753"
                 ),
-                proxy=PROXY,
+              #  proxy=PROXY,
             ) as sb:
                 try:
                     # --- 登录 ---
